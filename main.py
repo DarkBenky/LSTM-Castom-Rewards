@@ -7,12 +7,12 @@ import wandb
 
 # Initialize WandB
 wandb.init(project="LSTM_CNN_Comparison", config={
-    "epochs": 5,
+    "epochs": 3,
     "batch_size": 128,
     "num_values": 64,
     "future_window": 32,
-    "dropout": 0.2,
-    "neurons": 256
+    "dropout": 0.1,
+    "neurons": 128
 })
 config = wandb.config
 
@@ -337,7 +337,7 @@ def train_and_evaluate_price_model(model, X_price, y_price, model_name):
     print(f"\nTraining {model_name}...")
     
     # Compile model
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4), loss='mean_squared_error', metrics=['mae'])
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss='mean_squared_error', metrics=['mae'])
     
     # Training loop
     for epoch in range(EPOCHS):
@@ -375,7 +375,7 @@ def train_and_evaluate_price_model(model, X_price, y_price, model_name):
         # This is a simplified example and might need adjustments based on your specific use case
         profits = actual_prices - predictions
         for i in range(len(profits)):
-            wandb.log({f"{model_name}_profit_{i}": profits[i]})
+            wandb.log({f"{model_name}_profits": profits[i]})
         return np.mean(profits), np.std(profits)
     
     mean_profit, std_profit = calculate_profits(predictions, y_price)
