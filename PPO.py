@@ -1,210 +1,205 @@
-import tensorflow as tf
-from tf_agents.environments import py_environment
-from tf_agents.specs import array_spec
-from tf_agents.trajectories import time_step as ts
-from tf_agents.networks import actor_distribution_network, value_network
-from tf_agents.agents.ppo import ppo_agent
-from tf_agents.replay_buffers import tf_uniform_replay_buffer
-from tf_agents.drivers import dynamic_step_driver
-from tf_agents.metrics import tf_metrics
-from tf_agents.policies import random_tf_policy
-from tf_agents.trajectories import trajectory
-from tf_agents.utils import common
 import numpy as np
-import matplotlib.pyplot as plt
-import wandb
-from main import load_data
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Normal
+import gym
+from sklearn.preprocessing import MinMaxScaler
+import csv
+import pandas as pd
 
-# Initialize WandB
-wandb.init(project="PPO_Trading_Model", config={
-    "num_iterations": 1000,
-    "collect_steps_per_iteration": 100,
-    "replay_buffer_capacity": 10000,
-    "num_eval_episodes": 10,
-    "num_parallel_environments": 1
-})
-config = wandb.config
+# ... (keep the load_data and scale_data functions as they are)
+def load_data(filename):
+    data = []
+    with open(filename, newline='') as csvfile:
+        reader = csv.reader(csvfile)
+        for row in reader:
+            float_row = [np.float32(value.strip()) for value in row]
+            data.append(float_row[1:])
+    return np.array(data)
 
-# Trading Environment
-class TradingEnvironment(py_environment.PyEnvironment):
-    def __init__(self, data, window_size=64):
-        self._data = data
-        self._window_size = window_size
-        self._episode_ended = False
-        self._current_position = 0
-        self._current_step = window_size
-        self._initial_balance = 10000
-        self._balance = self._initial_balance
+def scale_data(data: np.array):
+    # Convert the numpy array to a DataFrame
+    df = pd.DataFrame(data=data)
 
-        self._action_spec = array_spec.BoundedArraySpec(
-            shape=(), dtype=np.int32, minimum=0, maximum=2, name='action')
-        self._observation_spec = array_spec.BoundedArraySpec(
-            shape=(window_size, data.shape[1]), dtype=np.float32, name='observation')
+    # Print the data ranges before scaling (for debugging)
+    print("Data ranges before scaling:")
+    print(df.describe())
 
-    def action_spec(self):
-        return self._action_spec
+    # Initialize the MinMaxScaler
+    scaler = MinMaxScaler(feature_range=(-1, 1))
 
-    def observation_spec(self):
-        return self._observation_spec
+    # Apply the scaler to each column
+    scaled_data = scaler.fit_transform(df)
 
-    def _reset(self):
-        self._current_step = self._window_size
-        self._balance = self._initial_balance
-        self._current_position = 0
-        self._episode_ended = False
-        return ts.restart(self._get_observation())
+    # Print the data ranges after scaling (for debugging)
+    print("Data ranges after scaling:")
+    df = pd.DataFrame(scaled_data)
 
-    def _step(self, action):
-        if self._episode_ended:
-            return self.reset()
+    return df
 
-        reward = 0
-        current_price = self._data[self._current_step][1]
 
-        if action == 1:  # Buy
-            if self._current_position == 0:
-                self._current_position = 1
-                reward -= current_price * 0.001  # Transaction cost
-        elif action == 2:  # Sell
-            if self._current_position == 1:
-                self._current_position = 0
-                reward += current_price * 0.999  # Transaction cost
+class TradingEnv(gym.Env):
+    def __init__(self, data):
+        super(TradingEnv, self).__init__()
+        self.data = data.values  # Convert DataFrame to numpy array
+        self.current_step = 0
+        self.current_position = 0  # 1: long position, -1: short position
 
-        self._current_step += 1
-        new_price = self._data[self._current_step][1]
-        
-        if self._current_position == 1:
-            reward += new_price - current_price
+        # Define action and observation space
+        self.action_space = gym.spaces.Box(low=-1, high=1, shape=(1,))  # Continuous action space
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(data.shape[1],))
 
-        self._balance += reward
+    def reset(self):
+        self.current_step = 0
+        self.current_position = 0
+        return self.data[self.current_step]
 
-        if self._current_step >= len(self._data) - 1:
-            self._episode_ended = True
-            return ts.termination(self._get_observation(), reward)
-        else:
-            return ts.transition(self._get_observation(), reward, discount=0.99)
+    def step(self, action):
+        # Convert continuous action to discrete
+        self.current_position = 1 if action[0] > 0 else -1
 
-    def _get_observation(self):
-        return self._data[self._current_step - self._window_size:self._current_step]
+        # Move to the next time step
+        self.current_step += 1
+        done = self.current_step >= len(self.data) - 1
+        next_state = self.data[self.current_step] if not done else self.data[-1]
 
-# Create the environment
-data = load_data('data.csv')
-train_env = TradingEnvironment(data)
-eval_env = TradingEnvironment(data)
+        # Calculate reward
+        reward = self._calculate_reward()
 
-# Define the agent
-fc_layer_params = (100, 50)
-actor_net = actor_distribution_network.ActorDistributionNetwork(
-    train_env.observation_spec(),
-    train_env.action_spec(),
-    fc_layer_params=fc_layer_params)
-value_net = value_network.ValueNetwork(
-    train_env.observation_spec(),
-    fc_layer_params=fc_layer_params)
+        return next_state, reward, done, {}
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+    def _calculate_reward(self):
+        if self.current_step > 0:
+            price_diff = self.data[self.current_step][1] - self.data[self.current_step - 1][1]
+            return self.current_position * price_diff
+        return 0
 
-train_step_counter = tf.Variable(0)
+# Actor network
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(Actor, self).__init__()
+        self.fc1 = nn.Linear(state_dim, 32)
+        self.fc2 = nn.Linear(32, 64)
+        self.fc3 = nn.Linear(64, action_dim)
 
-tf_agent = ppo_agent.PPOAgent(
-    train_env.time_step_spec(),
-    train_env.action_spec(),
-    optimizer=optimizer,
-    actor_net=actor_net,
-    value_net=value_net,
-    num_epochs=10,
-    train_step_counter=train_step_counter)
+    def forward(self, state):
+        x = torch.relu(self.fc1(state))
+        x = torch.relu(self.fc2(x))
+        return torch.tanh(self.fc3(x))
 
-tf_agent.initialize()
+# Critic network (unchanged)
+class Critic(nn.Module):
+    def __init__(self, state_dim):
+        super(Critic, self).__init__()
+        self.fc1 = nn.Linear(state_dim, 32)
+        self.fc2 = nn.Linear(32, 64)
+        self.fc3 = nn.Linear(64, 1)
 
-# Replay buffer and dataset
-replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
-    data_spec=tf_agent.collect_data_spec,
-    batch_size=train_env.batch_size,
-    max_length=config.replay_buffer_capacity)
+    def forward(self, state):
+        x = torch.relu(self.fc1(state))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
 
-replay_observer = [replay_buffer.add_batch]
+# PPO agent
+class PPO:
+    def __init__(self, state_dim, action_dim, lr, gamma, clip_epsilon, epochs):
+        self.actor = Actor(state_dim, action_dim)
+        self.critic = Critic(state_dim)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr)
+        self.gamma = gamma
+        self.clip_epsilon = clip_epsilon
+        self.epochs = epochs
 
-train_metrics = [
-    tf_metrics.NumberOfEpisodes(),
-    tf_metrics.EnvironmentSteps(),
-    tf_metrics.AverageReturnMetric(),
-    tf_metrics.AverageEpisodeLengthMetric(),
-]
+    def get_action(self, state):
+        state = torch.FloatTensor(state).unsqueeze(0)  # Add batch dimension
+        action_mean = self.actor(state)
+        cov_mat = torch.diag(torch.full(action_mean.shape, 0.1))
+        dist = Normal(action_mean, cov_mat)
+        action = dist.sample()
+        return action.detach().numpy().flatten()  # Remove batch dimension
 
-eval_policy = tf_agent.policy
-collect_policy = tf_agent.collect_policy
+    def update(self, states, actions, rewards, next_states, dones):
+        # Convert to tensor
+        states = torch.FloatTensor(np.array(states))
+        actions = torch.FloatTensor(np.array(actions))
+        rewards = torch.FloatTensor(np.array(rewards)).unsqueeze(1)
+        next_states = torch.FloatTensor(np.array(next_states))
+        dones = torch.FloatTensor(np.array(dones)).unsqueeze(1)
 
-collect_driver = dynamic_step_driver.DynamicStepDriver(
-    train_env,
-    collect_policy,
-    observers=replay_observer + train_metrics,
-    num_steps=config.collect_steps_per_iteration)
+        # Compute advantage
+        with torch.no_grad():
+            values = self.critic(states)
+            next_values = self.critic(next_states)
+
+        advantages = rewards + self.gamma * next_values * (1 - dones) - values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # PPO update
+        for _ in range(self.epochs):
+            action_means = self.actor(states)
+            dist = Normal(action_means, torch.full_like(action_means, 0.1))
+            new_log_probs = dist.log_prob(actions).sum(dim=1, keepdim=True)
+            old_log_probs = new_log_probs.detach()
+
+            ratio = torch.exp(new_log_probs - old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
+
+            actor_loss = -torch.min(surr1, surr2).mean()
+            critic_loss = nn.MSELoss()(self.critic(states), rewards + self.gamma * next_values * (1 - dones))
+
+            # Update actor
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            # Update critic
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic_optimizer.step()
 
 # Training loop
-def train_agent(n_iterations):
-    time_step = train_env.reset()
-    collect_driver.run(time_step)
+def train(env, agent, num_episodes):
+    for episode in range(num_episodes):
+        state = env.reset()
+        done = False
+        total_reward = 0
+        states, actions, rewards, next_states, dones = [], [], [], [], []
 
-    dataset = replay_buffer.as_dataset(
-        num_parallel_calls=3, sample_batch_size=64, num_steps=2).prefetch(3)
-    iterator = iter(dataset)
+        while not done:
+            action = agent.get_action(state)
+            next_state, reward, done, _ = env.step(action)
+            
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
+            next_states.append(next_state)
+            dones.append(done)
 
-    returns = []
-    for iteration in range(n_iterations):
-        time_step, _ = collect_driver.run(time_step)
-        experience, _ = next(iterator)
-        train_loss = tf_agent.train(experience=experience)
-        
-        step = tf_agent.train_step_counter.numpy()
+            state = next_state
+            total_reward += reward
 
-        if iteration % 10 == 0:
-            print(f'Iteration: {iteration}, Loss: {train_loss.loss.numpy()}')
-            avg_return = compute_avg_return(eval_env, tf_agent.policy, config.num_eval_episodes)
-            returns.append(avg_return)
-            print(f'Average Return: {avg_return}')
-            wandb.log({
-                'Iteration': iteration,
-                'Loss': train_loss.loss.numpy(),
-                'Average Return': avg_return
-            })
+        agent.update(states, actions, rewards, next_states, dones)
+        print(f"Episode {episode + 1}, Total Reward: {total_reward}")
 
-            plot_returns(returns, iteration)
+# Main execution
+if __name__ == "__main__":
+    # Load and preprocess your data
+    data = load_data("data.csv")
+    # scaled_data = scale_data(data)
 
-    return returns
 
-def compute_avg_return(environment, policy, num_episodes=10):
-    total_return = 0.0
-    for _ in range(num_episodes):
-        time_step = environment.reset()
-        episode_return = 0.0
-        while not time_step.is_last():
-            action_step = policy.action(time_step)
-            time_step = environment.step(action_step.action)
-            episode_return += time_step.reward
-        total_return += episode_return
-    avg_return = total_return / num_episodes
-    return avg_return.numpy()[0]
+    # Create the environment
+    env = TradingEnv(pd.DataFrame(data))
 
-def plot_returns(returns, iteration):
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(0, (iteration+1)*10, 10), returns)
-    plt.xlabel('Iterations')
-    plt.ylabel('Average Return')
-    plt.title('Average Return over Iterations')
-    plt.savefig(f'returns_plot_{iteration}.png')
-    wandb.log({"returns_plot": wandb.Image(f'returns_plot_{iteration}.png')})
-    plt.close()
+    # del scale_data
 
-# Run the training
-returns = train_agent(config.num_iterations)
+    # Initialize the PPO agent
+    state_dim = env.observation_space.shape[0]
+    action_dim = 1  # Single continuous action
+    agent = PPO(state_dim, action_dim, lr=0.001, gamma=0.99, clip_epsilon=0.2, epochs=5)
 
-# Final evaluation
-final_avg_return = compute_avg_return(eval_env, tf_agent.policy, config.num_eval_episodes)
-print(f'Final Average Return: {final_avg_return}')
-wandb.log({'Final Average Return': final_avg_return})
-
-# Save the trained model
-tf_agent.policy.save('ppo_trading_model')
-
-wandb.finish()
+    # Train the agent
+    train(env, agent, num_episodes=1000)
