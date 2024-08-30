@@ -58,7 +58,7 @@ data = np.array(scale_data(data=data))
 
 # Generate labels and input data
 window_size = 30 # Example window size
-future_window = 3  # Example future window
+future_window = 30  # Example future window
 X, Y = generateLabelsPrice(data, window_size, future_window)
 
 # Reshape the input data for LSTM (samples, time steps, features)
@@ -73,6 +73,8 @@ model.add(LSTM(1024, input_shape=(X.shape[1], X.shape[2]), return_sequences=True
 model.add(Dropout(0.2))
 model.add(LSTM(512))
 model.add(Dense(2048, activation='relu'))
+model.add(Dropout(0.2))
+model.add(Dense(2048, activation='relu'))
 model.add(Dense(2048, activation='relu'))
 model.add(Dense(1))  # Single output for the average future price
 
@@ -82,7 +84,7 @@ model.compile(optimizer='adam', loss='mse')
 model.summary()
 
 # Train the model
-history = model.fit(X_train, Y_train, epochs=3, batch_size=32, validation_data=(X_val, Y_val), verbose=1)
+history = model.fit(X_train, Y_train, epochs=10, batch_size=64, validation_data=(X_val, Y_val), verbose=1)
 
 # Evaluate the model
 loss = model.evaluate(X_val, Y_val)
@@ -96,7 +98,7 @@ Y_pred = model.predict(X_val)
 
 # Calculate profits
 # For simplicity, we'll use a constant transaction cost (e.g., 0.02 or 2%)
-transaction_cost = 0.02
+transaction_cost = 0 
 profits = (Y_val - Y_pred.squeeze()) - transaction_cost * abs(Y_val - Y_pred.squeeze())
 
 # Calculate cumulative profits
