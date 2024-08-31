@@ -164,3 +164,6 @@ if __name__ == "__main__":
     optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
 
     train(env, policy_network, optimizer)
+
+# TODO: Plot training & validation loss
+# TODO: Plot portfolio value over time
