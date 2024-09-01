@@ -85,6 +85,8 @@ class MyEnv:
         action_type = np.argmax(action[:2])  # buy, sell (hold removed)
         amount = action[2]  # amount in range 0-1
 
+
+        # TODO: fix the amount calculation
         if action_type == 0:  # Buy
             usd_to_spend = self.balance_usd * amount
             if usd_to_spend > self.balance_usd:
