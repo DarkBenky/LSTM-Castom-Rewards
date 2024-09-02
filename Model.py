@@ -26,7 +26,7 @@ def scale_data(data: np.array):
     print(df.describe())
 
     # Initialize the MinMaxScaler
-    scaler = MinMaxScaler(feature_range=(-1, 1))
+    scaler = MinMaxScaler(feature_range=(1, 2))
 
     # Apply the scaler to each column
     scaled_data = scaler.fit_transform(df)
@@ -206,7 +206,7 @@ def train(env, policy_network, optimizer, episodes=1000):
         wandb.log({
             "Episode": episode + 1,
             "Total Reward": total_reward,
-            "Portfolio Value": env.calculate_portfolio_value(),
+            "Portfolio Values": portfolio_values,
             "Average Loss": np.mean(losses)
         })
 
@@ -215,7 +215,7 @@ def train(env, policy_network, optimizer, episodes=1000):
 if __name__ == "__main__":
     # Example data: random price data for demonstration
     data = load_data("data.csv")
-    data = scale_data(data)
+    # data = scale_data(data)
 
     print(data)
 
