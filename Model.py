@@ -43,8 +43,8 @@ class MyEnv:
         self.balance_usd = balance_usd
         self.balance_btc = balance_btc
         self.done = False
-        self.window_size = 30
-        self.future_window = 1
+        self.window_size = 3
+        self.future_window = 30
         self.reset()
 
     def next_price(self):
@@ -58,6 +58,12 @@ class MyEnv:
     
     def calculate_portfolio_value_at_step(self, stepOffset):
         return self.balance_usd + self.balance_btc * self.data[self.step + self.window_size + stepOffset][1]
+    
+    def calculate_next_average_portfolio_value(self):
+        average_portfolio_value = 0
+        for i in range(self.future_window):
+            average_portfolio_value += self.calculate_portfolio_value_at_step(i)
+        return average_portfolio_value / self.future_window
 
     def reset(self):
         self.step = 0
@@ -100,9 +106,11 @@ class MyEnv:
 
         if nextStep:
             self.step += 1
-            portfolio_value_change = self.calculate_portfolio_value() - current_portfolio_value
+            # portfolio_value_change = self.calculate_portfolio_value() - current_portfolio_value
+            portfolio_value_change = self.calculate_next_average_portfolio_value() - current_portfolio_value
         else:
-            portfolio_value_change = self.calculate_portfolio_value_at_step(1) - current_portfolio_value
+            # portfolio_value_change = self.calculate_portfolio_value_at_step(1) - current_portfolio_value
+            portfolio_value_change = self.calculate_next_average_portfolio_value() - current_portfolio_value
             # remove the action from the portfolio value change
             if action_type == 0:
                 self.balance_btc -= btc_to_buy
@@ -132,9 +140,9 @@ class MyEnv:
 class PolicyNetwork(tf.keras.Model):
     def __init__(self):
         super(PolicyNetwork, self).__init__()
-        self.lstm = tf.keras.layers.LSTM(1024, return_sequences=False)
-        self.dense1 = tf.keras.layers.Dense(1024, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(1024, activation='relu')
+        self.lstm = tf.keras.layers.LSTM(128, return_sequences=False)
+        self.dense1 = tf.keras.layers.Dense(128, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(128, activation='relu')
         self.out = tf.keras.layers.Dense(3)  # 2 actions + amount
 
     def call(self, state):
@@ -166,22 +174,22 @@ def train(env, policy_network, optimizer, episodes=1000):
             with tf.GradientTape() as tape:
                 # Get action probabilities and amount from the policy network
                 action_and_amount = policy_network(state_input, training=True)  # Ensure the model is in training mode
-                # action_probs = action_and_amount[:, :2]
-                # amount = action_and_amount[:, 2]
+                action_probs = action_and_amount[:, :2]
+                amount = action_and_amount[:, 2]
 
                 # Sample an action based on the probabilities
-                # action_probs_np = action_probs.numpy().squeeze()
-                # action_type = np.random.choice(2, p=action_probs_np)
-                # chosen_action = np.zeros(3)
-                # chosen_action[action_type] = action_probs_np[action_type]
-                # chosen_action[2] = amount.numpy().squeeze()  # Amount is continuous between 0-1
+                action_probs_np = action_probs.numpy().squeeze()
+                action_type = np.random.choice(2, p=action_probs_np)
+                chosen_action = np.zeros(3)
+                chosen_action[action_type] = action_probs_np[action_type]
+                chosen_action[2] = amount.numpy().squeeze()  # Amount is continuous between 0-1
 
                 # Evaluate portfolio change for buy and sell
                 _, buy_advantage, _ = env.__step__([1, 0, 1], nextStep=False)  # 100% buy
                 _, sell_advantage, _ = env.__step__([0, 1, 1], nextStep=False)  # 100% sell
                 
                 # Calculate the chosen action's advantage
-                _, chosen_advantage, _ = env.__step__(action_and_amount.numpy().squeeze())
+                _, chosen_advantage, _ = env.__step__(chosen_action)
 
                 # Calculate the optimal advantage
                 optimal_advantage = max(buy_advantage, sell_advantage)
@@ -191,7 +199,7 @@ def train(env, policy_network, optimizer, episodes=1000):
 
                 # Convert optimal response to a tensor for loss calculation
                 optimal_response_tensor = tf.convert_to_tensor(optimal_response, dtype=tf.float32)
-                chosen_action_tensor = tf.convert_to_tensor(action_and_amount, dtype=tf.float32)
+                chosen_action_tensor = tf.convert_to_tensor(chosen_action, dtype=tf.float32)
 
                 # Compute the loss based on the difference between chosen and optimal response
                 loss = tf.reduce_mean(tf.square(chosen_action_tensor - optimal_response_tensor))
