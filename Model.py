@@ -55,6 +55,9 @@ class MyEnv:
     
     def calculate_portfolio_value(self):
         return self.balance_usd + self.balance_btc * self.data[self.step + self.window_size][1]
+    
+    def calculate_portfolio_value_at_step(self, stepOffset):
+        return self.balance_usd + self.balance_btc * self.data[self.step + self.window_size + stepOffset][1]
 
     def reset(self):
         self.step = 0
@@ -63,6 +66,7 @@ class MyEnv:
         self.balance_btc = 0.1
         self.current_observation = self.data[self.step:self.step+self.window_size]
         self.current_overall_balance = self.calculate_portfolio_value()
+        self.starting_overall_balance = self.calculate_portfolio_value()
 
         # Pad the new row with zeros to match the observation dimensions (2 -> 3)
         portfolio_info = [self.calculate_portfolio_value(), self.balance_btc, self.balance_usd]
@@ -72,63 +76,35 @@ class MyEnv:
 
         return self.current_observation
 
-    def __step__(self, action):
+    def __step__(self, action, nextStep=True):
         if self.done:
             raise ValueError("Environment is done, reset it before calling step.")
-        
-        penalty = 0
 
         current_price = self.data[self.step + self.window_size][1]
-        # current_value = self.calculate_portfolio_value()
-
         # Extract action and amount
         action_type = np.argmax(action[:2])  # buy, sell (hold removed)
         amount = action[2]  # amount in range 0-1
 
-
-        # TODO: fix the amount calculation
+        # Perform the action
         if action_type == 0:  # Buy
             usd_to_spend = self.balance_usd * amount
-            if usd_to_spend > self.balance_usd:
-                usd_to_spend = self.balance_usd
-                penalty = 10
             btc_to_buy = usd_to_spend / current_price
             self.balance_btc += btc_to_buy
             self.balance_usd -= usd_to_spend
         elif action_type == 1:  # Sell
             btc_to_sell = self.balance_btc * amount
-            if btc_to_sell > self.balance_btc:
-                btc_to_sell = self.balance_btc
-                penalty = 10
-
             self.balance_usd += btc_to_sell * current_price
             self.balance_btc -= btc_to_sell
 
-        self.step += 1
+        if nextStep:
+            self.step += 1
+            portfolio_value_change = self.calculate_portfolio_value() - self.starting_overall_balance
+        else:
+            portfolio_value_change = self.calculate_portfolio_value_at_step(1) - self.starting_overall_balance
 
         if self.step + self.window_size + self.future_window >= len(self.data):
             self.done = True
         
-        # calculate reward as the change in portfolio value
-        # new_value = self.calculate_portfolio_value()
-
-        next_price = self.next_price()
-        change_1 = (next_price - current_price) / current_price
-        change_10 = (np.mean(self.next_prices_window(10)) - current_price) / current_price
-        change_30 = (np.mean(self.next_prices_window(30)) - current_price) / current_price
-
-        reward = 0.5 * change_1 + 0.3 * change_10 + 0.2 * change_30
-
-        if action_type == 1:  # Sell
-            price_reward = -price_reward
-
-        # Penalize actions that exceed the balance
-        reward -= penalty
-
-        if self.calculate_portfolio_value() < 0:
-            self.done = True
-            reward -= 1000
-
         self.current_observation = self.data[self.step:self.step+self.window_size]
         
         # Pad the new row with zeros to match the observation dimensions (2 -> 3)
@@ -137,7 +113,7 @@ class MyEnv:
         padded_info[-1] = portfolio_info  # Add the portfolio info as the last row
         self.current_observation = np.hstack((self.current_observation, padded_info))
 
-        return self.current_observation, reward, self.done
+        return self.current_observation, portfolio_value_change, self.done
 
     def render(self):
         print(f"Step: {self.step}, USD: {self.balance_usd:.2f}, BTC: {self.balance_btc:.4f}, Portfolio Value: {self.calculate_portfolio_value():.2f}")
@@ -146,9 +122,9 @@ class MyEnv:
 class PolicyNetwork(tf.keras.Model):
     def __init__(self):
         super(PolicyNetwork, self).__init__()
-        self.lstm = tf.keras.layers.LSTM(128)
-        self.dense1 = tf.keras.layers.Dense(64, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(64, activation='relu')
+        self.lstm = tf.keras.layers.LSTM(1024, return_sequences=False)
+        self.dense1 = tf.keras.layers.Dense(512, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(512, activation='relu')
         self.out = tf.keras.layers.Dense(3)  # 2 actions + amount
 
     def call(self, state):
@@ -165,9 +141,6 @@ class PolicyNetwork(tf.keras.Model):
 
         return tf.concat([action_probs, amount], axis=-1)
 
-def safe_log(x, eps=1e-10):
-    return tf.math.log(tf.maximum(x, eps))
-
 def train(env, policy_network, optimizer, episodes=1000):
     for episode in range(episodes):
         state = env.reset()
@@ -175,55 +148,77 @@ def train(env, policy_network, optimizer, episodes=1000):
         portfolio_values = []
         losses = []
 
-        while True:
+        while not env.done:
             env.render()
-            state_input = np.expand_dims(state, axis=0)
-            action_and_amount = policy_network(state_input).numpy().squeeze()
-
-            next_state, reward, done = env.__step__(action_and_amount)
-            total_reward += reward
-            portfolio_values.append(env.calculate_portfolio_value())
-
+            state_input = tf.convert_to_tensor(np.expand_dims(state, axis=0), dtype=tf.float32)
+            
             with tf.GradientTape() as tape:
-                predicted_action_and_amount = policy_network(np.expand_dims(state, axis=0))
-                action_prob = predicted_action_and_amount[:, :2]
+                # Get action probabilities and amount from the policy network
+                action_and_amount = policy_network(state_input)
+                action_probs = action_and_amount[:, :2]
+                amount = action_and_amount[:, 2]
 
-                action_type = np.argmax(action_and_amount[:2])
-                action_prob_taken = action_prob[0, action_type]
+                # Sample an action based on the probabilities
+                action_probs_np = action_probs.numpy().squeeze()
+                action_type = np.random.choice(2, p=action_probs_np)
+                chosen_action = np.zeros(3)
+                chosen_action[action_type] = 1  # One-hot encoding for action type
+                chosen_action[2] = amount.numpy().squeeze()  # Amount is continuous between 0-1
 
-                loss = -safe_log(action_prob_taken) * reward
-                losses.append(loss.numpy())
-                print(f"Loss: {loss.numpy()} , Reward: {reward}, action_prob_taken: {action_prob_taken.numpy()}, amount: {action_and_amount[2]}")
+                # Evaluate portfolio change for buy and sell
+                buy = [1, 0, 1]  # 100% buy
+                sell = [0, 1, 1]  # 100% sell
 
+                # Calculate the advantage of each action
+                _, buy_advantage, _ = env.__step__(buy, nextStep=False)
+                _, sell_advantage, _ = env.__step__(sell, nextStep=False)
+                
+                # Calculate the chosen action's advantage
+                _, chosen_advantage, _ = env.__step__(chosen_action)
+
+                # Calculate the advantage of the chosen action compared to the best possible action
+                optimal_advantage = max(buy_advantage, sell_advantage)
+                advantage = chosen_advantage - optimal_advantage
+
+                # Define the loss as negative advantage (we want to maximize advantage)
+                loss = -tf.reduce_mean(tf.math.log(action_probs[:, action_type]) * advantage)
+            
+            wandb.log({"Loss": loss.numpy(),
+                        "Advantage": advantage,
+                        "Profit": env.calculate_portfolio_value() - env.starting_overall_balance,
+                       })
+
+            # Compute gradients and update the network
             grads = tape.gradient(loss, policy_network.trainable_variables)
             optimizer.apply_gradients(zip(grads, policy_network.trainable_variables))
 
-            if done:
+            total_reward += chosen_advantage
+            state = env.current_observation
+            portfolio_values.append(env.calculate_portfolio_value())
+            losses.append(loss.numpy())
+
+            if env.done:
                 break
-            state = next_state
 
         # Log metrics to W&B
         wandb.log({
             "Episode": episode + 1,
             "Total Reward": total_reward,
             "Portfolio Values": portfolio_values,
-            "Average Loss": np.mean(losses)
+            "Average Loss": np.mean(losses),
+            "Final Portfolio Value": env.calculate_portfolio_value()
         })
 
-        print(f"Episode {episode + 1}: Total Reward: {total_reward:.2f}")
+        print(f"Episode {episode + 1}: Total Reward: {total_reward:.2f}, Final Portfolio Value: {env.calculate_portfolio_value():.2f}")
 
 if __name__ == "__main__":
-    # Example data: random price data for demonstration
+    # Example data: load real data from file
     data = load_data("data.csv")
+    # Optionally scale data
     # data = scale_data(data)
-
-    print(data)
 
     env = MyEnv(data)
     policy_network = PolicyNetwork()
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
 
     train(env, policy_network, optimizer)
-
-# TODO: Plot training & validation loss
-# TODO: Plot portfolio value over time
