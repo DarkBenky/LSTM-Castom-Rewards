@@ -6,7 +6,7 @@ import csv
 
 import wandb
 
-wandb.init(project="btc-trading")
+wandb.init(project="btc")
 
 def load_data(filename):
     data = []
@@ -85,6 +85,8 @@ class MyEnv:
         action_type = np.argmax(action[:2])  # buy, sell (hold removed)
         amount = action[2]  # amount in range 0-1
 
+        current_portfolio_value = self.calculate_portfolio_value()
+
         # Perform the action
         if action_type == 0:  # Buy
             usd_to_spend = self.balance_usd * amount
@@ -98,9 +100,17 @@ class MyEnv:
 
         if nextStep:
             self.step += 1
-            portfolio_value_change = self.calculate_portfolio_value() - self.starting_overall_balance
+            portfolio_value_change = self.calculate_portfolio_value() - current_portfolio_value
         else:
-            portfolio_value_change = self.calculate_portfolio_value_at_step(1) - self.starting_overall_balance
+            portfolio_value_change = self.calculate_portfolio_value_at_step(1) - current_portfolio_value
+            # remove the action from the portfolio value change
+            if action_type == 0:
+                self.balance_btc -= btc_to_buy
+                self.balance_usd += usd_to_spend
+            elif action_type == 1:
+                self.balance_usd -= btc_to_sell * current_price
+                self.balance_btc += btc_to_sell
+
 
         if self.step + self.window_size + self.future_window >= len(self.data):
             self.done = True
@@ -123,8 +133,8 @@ class PolicyNetwork(tf.keras.Model):
     def __init__(self):
         super(PolicyNetwork, self).__init__()
         self.lstm = tf.keras.layers.LSTM(1024, return_sequences=False)
-        self.dense1 = tf.keras.layers.Dense(512, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(512, activation='relu')
+        self.dense1 = tf.keras.layers.Dense(1024, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(1024, activation='relu')
         self.out = tf.keras.layers.Dense(3)  # 2 actions + amount
 
     def call(self, state):
@@ -141,6 +151,7 @@ class PolicyNetwork(tf.keras.Model):
 
         return tf.concat([action_probs, amount], axis=-1)
 
+
 def train(env, policy_network, optimizer, episodes=1000):
     for episode in range(episodes):
         state = env.reset()
@@ -154,43 +165,51 @@ def train(env, policy_network, optimizer, episodes=1000):
             
             with tf.GradientTape() as tape:
                 # Get action probabilities and amount from the policy network
-                action_and_amount = policy_network(state_input)
-                action_probs = action_and_amount[:, :2]
-                amount = action_and_amount[:, 2]
+                action_and_amount = policy_network(state_input, training=True)  # Ensure the model is in training mode
+                # action_probs = action_and_amount[:, :2]
+                # amount = action_and_amount[:, 2]
 
                 # Sample an action based on the probabilities
-                action_probs_np = action_probs.numpy().squeeze()
-                action_type = np.random.choice(2, p=action_probs_np)
-                chosen_action = np.zeros(3)
-                chosen_action[action_type] = 1  # One-hot encoding for action type
-                chosen_action[2] = amount.numpy().squeeze()  # Amount is continuous between 0-1
+                # action_probs_np = action_probs.numpy().squeeze()
+                # action_type = np.random.choice(2, p=action_probs_np)
+                # chosen_action = np.zeros(3)
+                # chosen_action[action_type] = action_probs_np[action_type]
+                # chosen_action[2] = amount.numpy().squeeze()  # Amount is continuous between 0-1
 
                 # Evaluate portfolio change for buy and sell
-                buy = [1, 0, 1]  # 100% buy
-                sell = [0, 1, 1]  # 100% sell
-
-                # Calculate the advantage of each action
-                _, buy_advantage, _ = env.__step__(buy, nextStep=False)
-                _, sell_advantage, _ = env.__step__(sell, nextStep=False)
+                _, buy_advantage, _ = env.__step__([1, 0, 1], nextStep=False)  # 100% buy
+                _, sell_advantage, _ = env.__step__([0, 1, 1], nextStep=False)  # 100% sell
                 
                 # Calculate the chosen action's advantage
-                _, chosen_advantage, _ = env.__step__(chosen_action)
+                _, chosen_advantage, _ = env.__step__(action_and_amount.numpy().squeeze())
 
-                # Calculate the advantage of the chosen action compared to the best possible action
+                # Calculate the optimal advantage
                 optimal_advantage = max(buy_advantage, sell_advantage)
-                advantage = chosen_advantage - optimal_advantage
 
-                # Define the loss as negative advantage (we want to maximize advantage)
-                loss = -tf.reduce_mean(tf.math.log(action_probs[:, action_type]) * advantage)
-            
-            wandb.log({"Loss": loss.numpy(),
-                        "Advantage": advantage,
-                        "Profit": env.calculate_portfolio_value() - env.starting_overall_balance,
-                       })
+                # Define the optimal response based on the maximum advantage
+                optimal_response = [1, 0, 1] if buy_advantage > sell_advantage else [0, 1, 1]
+
+                # Convert optimal response to a tensor for loss calculation
+                optimal_response_tensor = tf.convert_to_tensor(optimal_response, dtype=tf.float32)
+                chosen_action_tensor = tf.convert_to_tensor(action_and_amount, dtype=tf.float32)
+
+                # Compute the loss based on the difference between chosen and optimal response
+                loss = tf.reduce_mean(tf.square(chosen_action_tensor - optimal_response_tensor))
+                # print(f"Chosen: {action_and_amount}, Optimal: {optimal_response}, Loss: {loss.numpy()}")
+
+                # Log metrics
+                wandb.log({
+                    "Loss": loss.numpy(),
+                    "Advantage Error": chosen_advantage - optimal_advantage,
+                    "Profit": env.calculate_portfolio_value() - env.starting_overall_balance,
+                })
 
             # Compute gradients and update the network
             grads = tape.gradient(loss, policy_network.trainable_variables)
-            optimizer.apply_gradients(zip(grads, policy_network.trainable_variables))
+            if any(g is not None for g in grads):
+                optimizer.apply_gradients(zip(grads, policy_network.trainable_variables))
+            else:
+                print("No gradients provided")
 
             total_reward += chosen_advantage
             state = env.current_observation
@@ -211,6 +230,7 @@ def train(env, policy_network, optimizer, episodes=1000):
 
         print(f"Episode {episode + 1}: Total Reward: {total_reward:.2f}, Final Portfolio Value: {env.calculate_portfolio_value():.2f}")
 
+
 if __name__ == "__main__":
     # Example data: load real data from file
     data = load_data("data.csv")
@@ -219,6 +239,6 @@ if __name__ == "__main__":
 
     env = MyEnv(data)
     policy_network = PolicyNetwork()
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
 
     train(env, policy_network, optimizer)
