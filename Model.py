@@ -43,7 +43,7 @@ class MyEnv:
         self.balance_usd = balance_usd
         self.balance_btc = balance_btc
         self.done = False
-        self.window_size = 3
+        self.window_size = 30
         self.future_window = 30
         self.reset()
 
@@ -241,7 +241,7 @@ def train(env, policy_network, optimizer, episodes=1000):
 
 if __name__ == "__main__":
     # Example data: load real data from file
-    data = load_data("data.csv")
+    data = load_data("bybit.csv")
     # Optionally scale data
     # data = scale_data(data)
 
