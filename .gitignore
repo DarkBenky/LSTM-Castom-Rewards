@@ -1,3 +1,4 @@
 # ignore .venv and wandb
 .venv
 /wandb
+bybit.csv
