@@ -138,18 +138,30 @@ class MyEnv:
 
 # Define a simple policy network
 class PolicyNetwork(tf.keras.Model):
-    def __init__(self):
+    def __init__(self, lstm_units=128, dense_units=256, num_lstm_layers=2, num_dense_layers=2, dropout_rate=0.2):
         super(PolicyNetwork, self).__init__()
-        self.lstm = tf.keras.layers.LSTM(128, return_sequences=False)
-        self.dense1 = tf.keras.layers.Dense(128, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(128, activation='relu')
+        
+        self.lstm_layers = [tf.keras.layers.LSTM(lstm_units, return_sequences=True) for _ in range(num_lstm_layers - 1)]
+        self.lstm_layers.append(tf.keras.layers.LSTM(lstm_units))  # Last LSTM layer doesn't return sequences
+        
+        self.dense_layers = [tf.keras.layers.Dense(dense_units, activation='relu') for _ in range(num_dense_layers)]
+        
+        self.dropout = tf.keras.layers.Dropout(dropout_rate)
         self.out = tf.keras.layers.Dense(3)  # 2 actions + amount
 
-    def call(self, state):
+    def call(self, state, training=False):
         x = tf.convert_to_tensor(state, dtype=tf.float32)
-        x = self.lstm(x)
-        x = self.dense1(x)
-        x = self.dense2(x)
+        
+        # Apply LSTM layers
+        for lstm_layer in self.lstm_layers:
+            x = lstm_layer(x)
+            x = self.dropout(x, training=training)
+        
+        # Apply dense layers
+        for dense_layer in self.dense_layers:
+            x = dense_layer(x)
+            x = self.dropout(x, training=training)
+
         output = self.out(x)
 
         # Split into action probabilities and amount
@@ -158,9 +170,14 @@ class PolicyNetwork(tf.keras.Model):
         amount = tf.nn.sigmoid(amount)  # Amount in range 0-1
 
         return tf.concat([action_probs, amount], axis=-1)
+    
+    def save(self, path):
+        self.save_weights(path)
 
 
-def train(env, policy_network, optimizer, episodes=1000):
+def train(env, policy_network, optimizer, episodes=1000, name: str = "model"):
+    best_portfolio_value = 0
+
     for episode in range(episodes):
         state = env.reset()
         total_reward = 0
@@ -169,7 +186,8 @@ def train(env, policy_network, optimizer, episodes=1000):
 
         while not env.done:
             env.render()
-            state_input = tf.convert_to_tensor(np.expand_dims(state, axis=0), dtype=tf.float32)
+            state_input = tf.convert_to_tensor(state, dtype=tf.float32)
+            state_input = tf.expand_dims(state_input, axis=-1)  # Expand the shape to 30 * 96 * 1
             
             with tf.GradientTape() as tape:
                 # Get action probabilities and amount from the policy network
@@ -179,10 +197,12 @@ def train(env, policy_network, optimizer, episodes=1000):
 
                 # Sample an action based on the probabilities
                 action_probs_np = action_probs.numpy().squeeze()
+                action_probs_np = np.mean(action_probs_np, axis=0)  # Average the probabilities across the window
                 action_type = np.random.choice(2, p=action_probs_np)
                 chosen_action = np.zeros(3)
-                chosen_action[action_type] = action_probs_np[action_type]
-                chosen_action[2] = amount.numpy().squeeze()  # Amount is continuous between 0-1
+                chosen_action[action_type] =  1
+                amount = amount.numpy().squeeze()
+                chosen_action[2] =  np.mean(amount, axis=0)  # Average the amount across the window
 
                 # Evaluate portfolio change for buy and sell
                 _, buy_advantage, _ = env.__step__([1, 0, 1], nextStep=False)  # 100% buy
@@ -236,6 +256,12 @@ def train(env, policy_network, optimizer, episodes=1000):
             "Final Portfolio Value": env.calculate_portfolio_value()
         })
 
+        if env.calculate_portfolio_value() > best_portfolio_value:
+            
+            print(f"New best portfolio value: {env.calculate_portfolio_value():.2f} is better than {best_portfolio_value / env.calculate_portfolio_value() * 100:.2f}")
+            best_portfolio_value = env.calculate_portfolio_value()
+            policy_network.save(name)
+
         print(f"Episode {episode + 1}: Total Reward: {total_reward:.2f}, Final Portfolio Value: {env.calculate_portfolio_value():.2f}")
 
 
@@ -246,7 +272,34 @@ if __name__ == "__main__":
     # data = scale_data(data)
 
     env = MyEnv(data)
-    policy_network = PolicyNetwork()
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
 
-    train(env, policy_network, optimizer)
+    import random
+     
+    network_layers = {
+        "lstm_units":512,
+        "dense_units":256,
+        "num_lstm_layers":3,
+        "num_dense_layers":3,
+        "dropout_rate":0.2
+    }
+
+    modelName = f"model-{random.randint(0, 10000)} + {network_layers['lstm_units']} + {network_layers['dense_units']} + {network_layers['num_lstm_layers']} + {network_layers['num_dense_layers']} + {network_layers['dropout_rate']}"
+
+    policy_network = PolicyNetwork(**network_layers)
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+
+    example_state = env.reset()
+    example_state_input = tf.convert_to_tensor(example_state, dtype=tf.float32)
+
+    print(f"Example state shape: {example_state_input.shape}")
+    # Expand the shape to 30 * 96 * 1 
+    example_state_input = tf.expand_dims(example_state_input, axis=-1)
+    print(f"Expanded state shape: {example_state_input.shape}")
+
+    policy_network.build(input_shape=example_state_input.shape)
+    policy_network.summary()
+
+    wandb.log({"model_summary": network_layers})
+
+    train(env, policy_network, optimizer, name=modelName)
